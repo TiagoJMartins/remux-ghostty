@@ -1360,6 +1360,17 @@ GHOSTTY_API ghostty_terminal_producer_result_e ghostty_terminal_producer_feed(
     ghostty_terminal_producer_t,
     const uint8_t*,
     size_t);
+// Resizes the producer's canonical terminal, reflowing the primary screen.
+// Unlike recreating a producer this preserves scrollback, cursor state, and
+// every mode the running program set, so an embedder whose view geometry
+// changes does not have to reconstruct VT state by hand. Dimensions must be
+// nonzero. Renderers over the retained terminal must be notified separately
+// with ghostty_terminal_surface_terminal_changed.
+GHOSTTY_API ghostty_terminal_producer_result_e
+ghostty_terminal_producer_set_size(
+    ghostty_terminal_producer_t,
+    uint16_t,
+    uint16_t);
 GHOSTTY_API void ghostty_terminal_producer_free(ghostty_terminal_producer_t);
 GHOSTTY_API void ghostty_terminal_release(ghostty_terminal_t);
 

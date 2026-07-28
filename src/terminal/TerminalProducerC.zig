@@ -59,6 +59,20 @@ pub const Producer = struct {
         defer self.terminal.mutex.unlock();
         self.stream.nextSlice(bytes);
     }
+
+    /// Resize the canonical terminal in place, reflowing the primary screen.
+    ///
+    /// This goes straight to Terminal.resize rather than through the VT
+    /// handler: the handler's only extra work is the mode-2048 in-band size
+    /// report, and a producer's stream uses the readonly effect set (no
+    /// write_pty), so that report would be dropped anyway. Embedders own the
+    /// write-back path and are expected to report size on it themselves.
+    fn setSize(self: *Producer, columns: u16, rows: u16) !void {
+        self.terminal.mutex.lock();
+        defer self.terminal.mutex.unlock();
+        const terminal = &self.terminal.terminal;
+        try terminal.resize(terminal.gpa(), columns, rows);
+    }
 };
 
 pub export fn ghostty_terminal_producer_config_new() Config {
@@ -103,6 +117,17 @@ pub export fn ghostty_terminal_producer_feed(
     return .ok;
 }
 
+pub export fn ghostty_terminal_producer_set_size(
+    producer: ?*Producer,
+    columns: u16,
+    rows: u16,
+) Result {
+    const value = producer orelse return .invalid_input;
+    if (columns == 0 or rows == 0) return .invalid_input;
+    value.setSize(columns, rows) catch return .out_of_memory;
+    return .ok;
+}
+
 pub export fn ghostty_terminal_producer_free(producer: ?*Producer) void {
     if (producer) |value| value.deinit();
 }
@@ -130,6 +155,7 @@ test "terminal producer C ABI matches ghostty header" {
     try testing.expect(@hasDecl(c, "ghostty_terminal_producer_new"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_producer_retain_terminal"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_producer_feed"));
+    try testing.expect(@hasDecl(c, "ghostty_terminal_producer_set_size"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_producer_free"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_release"));
     try testing.expectEqual(
@@ -344,4 +370,66 @@ test "terminal producer partial initialization is allocation safe" {
     }
 
     try testing.expect(observed_success);
+}
+
+test "terminal producer set_size reflows and preserves modes" {
+    const testing = std.testing;
+    state.alloc = testing.allocator;
+
+    const config: Config = .{ .columns = 10, .rows = 4 };
+    var producer: ?*Producer = null;
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_terminal_producer_new(&config, &producer),
+    );
+    defer ghostty_terminal_producer_free(producer);
+
+    // A program that enables mouse reporting once at startup, then prints a
+    // line long enough to wrap at 10 columns.
+    const prologue = "\x1b[?1000h";
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_terminal_producer_feed(producer, prologue.ptr, prologue.len),
+    );
+    const text = "abcdefghijkl";
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_terminal_producer_feed(producer, text.ptr, text.len),
+    );
+
+    const terminal = &producer.?.terminal.terminal;
+    try testing.expect(terminal.modes.get(.mouse_event_normal));
+    {
+        const wrapped = try terminal.plainString(testing.allocator);
+        defer testing.allocator.free(wrapped);
+        try testing.expectEqualStrings("abcdefghij\nkl", wrapped);
+    }
+
+    try testing.expectEqual(
+        Result.invalid_input,
+        ghostty_terminal_producer_set_size(null, 20, 4),
+    );
+    try testing.expectEqual(
+        Result.invalid_input,
+        ghostty_terminal_producer_set_size(producer, 0, 4),
+    );
+    try testing.expectEqual(
+        Result.invalid_input,
+        ghostty_terminal_producer_set_size(producer, 20, 0),
+    );
+
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_terminal_producer_set_size(producer, 20, 4),
+    );
+    try testing.expectEqual(@as(u16, 20), terminal.cols);
+    try testing.expectEqual(@as(u16, 4), terminal.rows);
+
+    // The wrapped line reflowed into the wider grid, and the mode the program
+    // set once at startup survived — the whole reason this exists instead of
+    // recreating the producer.
+    const reflowed = try terminal.plainString(testing.allocator);
+    defer testing.allocator.free(reflowed);
+    try testing.expectEqualStrings("abcdefghijkl", reflowed);
+    try testing.expect(terminal.modes.get(.mouse_event_normal));
 }
