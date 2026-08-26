@@ -186,14 +186,29 @@ pub const Producer = struct {
     ///
     /// This goes straight to Terminal.resize rather than through the VT
     /// handler: the handler's only extra work is the mode-2048 in-band size
-    /// report, and a producer's stream uses the readonly effect set (no
-    /// write_pty), so that report would be dropped anyway. Embedders own the
-    /// write-back path and are expected to report size on it themselves.
-    fn setSize(self: *Producer, columns: u16, rows: u16) !void {
+    /// report, which is the host PTY's job (the real program learns its size
+    /// via TIOCSWINSZ there), not the mirror's.
+    ///
+    /// The cell pixel dimensions matter beyond size reports: they set the
+    /// terminal's width_px/height_px, which the Kitty graphics `pixelSize`
+    /// math divides by cols/rows to get a cell size. A terminal left at the
+    /// 0x0 default renders every `c=`/`r=` scaled placement as 0x0 pixels —
+    /// silently, since emitters place with q=2.
+    fn setSize(
+        self: *Producer,
+        columns: u16,
+        rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) !void {
         self.terminal.mutex.lock();
         defer self.terminal.mutex.unlock();
         const terminal = &self.terminal.terminal;
         try terminal.resize(terminal.gpa(), columns, rows);
+        terminal.width_px = std.math.mul(u32, columns, cell_width_px) catch
+            std.math.maxInt(u32);
+        terminal.height_px = std.math.mul(u32, rows, cell_height_px) catch
+            std.math.maxInt(u32);
     }
 };
 
@@ -243,10 +258,14 @@ pub export fn ghostty_terminal_producer_set_size(
     producer: ?*Producer,
     columns: u16,
     rows: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
 ) Result {
     const value = producer orelse return .invalid_input;
     if (columns == 0 or rows == 0) return .invalid_input;
-    value.setSize(columns, rows) catch return .out_of_memory;
+    if (cell_width_px == 0 or cell_height_px == 0) return .invalid_input;
+    value.setSize(columns, rows, cell_width_px, cell_height_px) catch
+        return .out_of_memory;
     return .ok;
 }
 
@@ -578,23 +597,37 @@ test "terminal producer set_size reflows and preserves modes" {
 
     try testing.expectEqual(
         Result.invalid_input,
-        ghostty_terminal_producer_set_size(null, 20, 4),
+        ghostty_terminal_producer_set_size(null, 20, 4, 9, 18),
     );
     try testing.expectEqual(
         Result.invalid_input,
-        ghostty_terminal_producer_set_size(producer, 0, 4),
+        ghostty_terminal_producer_set_size(producer, 0, 4, 9, 18),
     );
     try testing.expectEqual(
         Result.invalid_input,
-        ghostty_terminal_producer_set_size(producer, 20, 0),
+        ghostty_terminal_producer_set_size(producer, 20, 0, 9, 18),
+    );
+    try testing.expectEqual(
+        Result.invalid_input,
+        ghostty_terminal_producer_set_size(producer, 20, 4, 0, 18),
+    );
+    try testing.expectEqual(
+        Result.invalid_input,
+        ghostty_terminal_producer_set_size(producer, 20, 4, 9, 0),
     );
 
     try testing.expectEqual(
         Result.ok,
-        ghostty_terminal_producer_set_size(producer, 20, 4),
+        ghostty_terminal_producer_set_size(producer, 20, 4, 9, 18),
     );
     try testing.expectEqual(@as(u16, 20), terminal.cols);
     try testing.expectEqual(@as(u16, 4), terminal.rows);
+
+    // The pixel size is what Kitty graphics placements divide by cols/rows
+    // for a cell size: left at the 0x0 default, every `c=`/`r=` scaled
+    // placement renders 0x0 and images silently vanish.
+    try testing.expectEqual(@as(u32, 20 * 9), terminal.width_px);
+    try testing.expectEqual(@as(u32, 4 * 18), terminal.height_px);
 
     // The wrapped line reflowed into the wider grid, and the mode the program
     // set once at startup survived — the whole reason this exists instead of

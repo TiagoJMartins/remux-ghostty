@@ -1438,14 +1438,19 @@ GHOSTTY_API ghostty_terminal_producer_result_e ghostty_terminal_producer_feed(
 // Resizes the producer's canonical terminal, reflowing the primary screen.
 // Unlike recreating a producer this preserves scrollback, cursor state, and
 // every mode the running program set, so an embedder whose view geometry
-// changes does not have to reconstruct VT state by hand. Dimensions must be
+// changes does not have to reconstruct VT state by hand. The cell pixel
+// dimensions set the terminal's pixel size, which Kitty graphics placements
+// scaled by c=/r= divide by cols/rows for a cell size — without them those
+// placements render 0x0 and images silently vanish. All dimensions must be
 // nonzero. Renderers over the retained terminal must be notified separately
 // with ghostty_terminal_surface_terminal_changed.
 GHOSTTY_API ghostty_terminal_producer_result_e
 ghostty_terminal_producer_set_size(
     ghostty_terminal_producer_t,
-    uint16_t,
-    uint16_t);
+    uint16_t columns,
+    uint16_t rows,
+    uint32_t cell_width_px,
+    uint32_t cell_height_px);
 // Installs (or clears) the producer's effect callbacks. A NULL callbacks
 // pointer clears every member, restoring the readonly behaviour a producer has
 // before this is called; a struct with a null member clears that member alone.
