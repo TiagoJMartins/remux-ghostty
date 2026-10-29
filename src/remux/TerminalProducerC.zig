@@ -78,7 +78,7 @@ pub const Callbacks = extern struct {
         clipboard.Location,
         ?[*]const ClipboardContent,
         usize,
-    ) callconv(.c) clipboard.WriteResult;
+    ) callconv(.c) clipboard.Write.Status;
 };
 
 pub const Producer = struct {
@@ -140,7 +140,7 @@ pub const Producer = struct {
         return @fieldParentPtr("stream", stream_ptr);
     }
 
-    fn writePtyTrampoline(handler: *TerminalStream.Handler, data: [:0]const u8) void {
+    fn writePtyTrampoline(handler: *TerminalStream.Handler, data: []const u8) void {
         const self = fromHandler(handler);
         const func = self.callbacks.write_pty orelse return;
         func(self, self.callbacks.userdata, data.ptr, data.len);
@@ -149,8 +149,22 @@ pub const Producer = struct {
     fn clipboardWriteTrampoline(
         handler: *TerminalStream.Handler,
         write: clipboard.Write,
-    ) clipboard.WriteResult {
-        const self = fromHandler(handler);
+    ) void {
+        write.reply(statusResult(clipboardWriteStatus(fromHandler(handler), write)));
+    }
+
+    fn statusResult(status: clipboard.Write.Status) clipboard.Write.Result {
+        return switch (status) {
+            .success => .{ .success = .{} },
+            .denied => .denied,
+            .unsupported => .unsupported,
+            .busy => .busy,
+            .invalid_data => .invalid_data,
+            else => .io_error,
+        };
+    }
+
+    fn clipboardWriteStatus(self: *Producer, write: clipboard.Write) clipboard.Write.Status {
         const func = self.callbacks.clipboard_write orelse return .unsupported;
 
         // OSC 52 produces one representation today, so keep that path
@@ -425,11 +439,11 @@ test "terminal producer C ABI matches ghostty header" {
         @as(c_int, c.GHOSTTY_TERMINAL_PRODUCER_CLIPBOARD_PRIMARY),
     );
     try testing.expectEqual(
-        @as(c_int, @intFromEnum(clipboard.WriteResult.success)),
+        @as(c_int, @intFromEnum(clipboard.Write.Status.success)),
         @as(c_int, c.GHOSTTY_TERMINAL_PRODUCER_CLIPBOARD_SUCCESS),
     );
     try testing.expectEqual(
-        @as(c_int, @intFromEnum(clipboard.WriteResult.io_error)),
+        @as(c_int, @intFromEnum(clipboard.Write.Status.io_error)),
         @as(c_int, c.GHOSTTY_TERMINAL_PRODUCER_CLIPBOARD_IO_ERROR),
     );
 }
@@ -942,7 +956,7 @@ const CaptureCallbacks = struct {
     var clipboard_data: ?[]u8 = null;
     var clipboard_location: clipboard.Location = .standard;
     var clipboard_count: usize = 0;
-    var clipboard_verdict: clipboard.WriteResult = .success;
+    var clipboard_verdict: clipboard.Write.Status = .success;
 
     fn reset() void {
         const alloc = std.testing.allocator;
@@ -977,7 +991,7 @@ const CaptureCallbacks = struct {
         location: clipboard.Location,
         contents: ?[*]const ClipboardContent,
         contents_len: usize,
-    ) callconv(.c) clipboard.WriteResult {
+    ) callconv(.c) clipboard.Write.Status {
         const alloc = std.testing.allocator;
         userdata = ud;
         producer_seen = producer;
