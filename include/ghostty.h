@@ -1459,6 +1459,77 @@ typedef struct {
   size_t max_scrollback;
 } ghostty_terminal_producer_config_s;
 
+// Where an OSC 52 clipboard write is destined.
+typedef enum {
+  GHOSTTY_TERMINAL_PRODUCER_CLIPBOARD_STANDARD = 0,
+  GHOSTTY_TERMINAL_PRODUCER_CLIPBOARD_SELECTION = 1,
+  GHOSTTY_TERMINAL_PRODUCER_CLIPBOARD_PRIMARY = 2,
+} ghostty_terminal_producer_clipboard_location_e;
+
+// The embedder's verdict on a clipboard write.
+typedef enum {
+  GHOSTTY_TERMINAL_PRODUCER_CLIPBOARD_SUCCESS = 0,
+  GHOSTTY_TERMINAL_PRODUCER_CLIPBOARD_DENIED = 1,
+  GHOSTTY_TERMINAL_PRODUCER_CLIPBOARD_UNSUPPORTED = 2,
+  GHOSTTY_TERMINAL_PRODUCER_CLIPBOARD_BUSY = 3,
+  GHOSTTY_TERMINAL_PRODUCER_CLIPBOARD_INVALID_DATA = 4,
+  GHOSTTY_TERMINAL_PRODUCER_CLIPBOARD_IO_ERROR = 5,
+} ghostty_terminal_producer_clipboard_result_e;
+
+// One representation of a clipboard write. Both strings are pointer+length
+// rather than NUL-terminated: an OSC 52 payload is base64-DECODED before it
+// arrives, so it is arbitrary bytes and may contain NUL. Borrowed — valid
+// only for the duration of the callback.
+typedef struct {
+  const uint8_t* mime_ptr;
+  size_t mime_len;
+  const uint8_t* data_ptr;
+  size_t data_len;
+} ghostty_terminal_producer_clipboard_content_s;
+
+// Bytes the terminal is answering the program with — a DECRQM reply, a Kitty
+// graphics response, an XTVERSION report. Write them to whatever carries input
+// back to the program. Borrowed for the call only.
+typedef void (*ghostty_terminal_producer_write_pty_cb)(
+    ghostty_terminal_producer_t,
+    void* userdata,
+    const uint8_t* data,
+    size_t len);
+
+// An OSC 52 clipboard WRITE. Read requests never reach this callback: the VT
+// handler refuses them earlier, so a program cannot read the clipboard back.
+// An empty contents array clears the destination.
+typedef ghostty_terminal_producer_clipboard_result_e (
+    *ghostty_terminal_producer_clipboard_write_cb)(
+    ghostty_terminal_producer_t,
+    void* userdata,
+    ghostty_terminal_producer_clipboard_location_e,
+    const ghostty_terminal_producer_clipboard_content_s* contents,
+    size_t contents_len);
+
+// Callbacks for the effects a producer's stream can raise.
+//
+// A producer defaults to a READONLY stream, which drops every sequence that
+// needs a response or an outside side effect. That is right for a pure state
+// mirror and wrong for a terminal a program talks to: with no write_pty the
+// stream cannot answer a query at all, and the Kitty graphics protocol gates
+// its response on write_pty being set — so an embedder that leaves this unset
+// can never advertise image support, because the support query goes
+// unanswered.
+//
+// A null member is a no-op, and members may be set, changed or cleared at any
+// time; the change applies to the next fed byte.
+//
+// THREADING: every callback fires from inside ghostty_terminal_producer_feed
+// while the producer's terminal lock is held. An implementation MUST NOT call
+// back into the same producer (feed, set_size, set_callbacks, free) or it will
+// deadlock, and MUST NOT retain any pointer it is handed.
+typedef struct {
+  void* userdata;
+  ghostty_terminal_producer_write_pty_cb write_pty;
+  ghostty_terminal_producer_clipboard_write_cb clipboard_write;
+} ghostty_terminal_producer_callbacks_s;
+
 // Renderer-only surface over an externally supplied ghostty_terminal_t.
 
 typedef enum {
@@ -1574,11 +1645,15 @@ typedef struct {
 GHOSTTY_API ghostty_terminal_producer_config_s
 ghostty_terminal_producer_config_new(void);
 // Creates a new terminal and its persistent VT parser without a PTY,
-// subprocess, transport, callbacks, or renderer. All calls for one producer
-// must be serialized by the caller. Feed input is length-delimited, preserves
-// parser state across calls, and does not notify renderers. After feeding a
-// terminal with a live surface, the host calls
+// subprocess, transport, or renderer. All calls for one producer must be
+// serialized by the caller. Feed input is length-delimited, preserves parser
+// state across calls, and does not notify renderers. After feeding a terminal
+// with a live surface, the host calls
 // ghostty_terminal_surface_terminal_changed explicitly.
+//
+// A new producer answers nothing: its stream starts readonly, so queries are
+// parsed and dropped. Install ghostty_terminal_producer_set_callbacks to give
+// it a voice.
 GHOSTTY_API ghostty_terminal_producer_result_e ghostty_terminal_producer_new(
     const ghostty_terminal_producer_config_s*,
     ghostty_terminal_producer_t*);
@@ -1631,6 +1706,14 @@ ghostty_terminal_producer_resize_and_feed(
     uint32_t cell_height_px,
     const uint8_t*,
     size_t);
+// Installs (or clears) the producer's effect callbacks. A NULL callbacks
+// pointer clears every member, restoring the readonly behaviour a producer has
+// before this is called; a struct with a null member clears that member alone.
+// Safe to call at any time — the change applies to the next fed byte.
+GHOSTTY_API ghostty_terminal_producer_result_e
+ghostty_terminal_producer_set_callbacks(
+    ghostty_terminal_producer_t,
+    const ghostty_terminal_producer_callbacks_s*);
 GHOSTTY_API void ghostty_terminal_producer_free(ghostty_terminal_producer_t);
 GHOSTTY_API void ghostty_terminal_release(ghostty_terminal_t);
 

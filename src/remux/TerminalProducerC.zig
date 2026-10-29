@@ -6,6 +6,7 @@
 const std = @import("std");
 const global = @import("../global.zig");
 const SharedTerminal = @import("Shared.zig");
+const clipboard = @import("../terminal/clipboard.zig");
 const TerminalStream = @import("../terminal/stream_terminal.zig").Stream;
 
 pub const Result = enum(c_int) {
@@ -21,10 +22,73 @@ pub const Config = extern struct {
     max_scrollback: usize = 10_000,
 };
 
+/// One representation of a clipboard write. Both strings are ptr+len rather
+/// than NUL-terminated because an OSC 52 payload is base64-DECODED before it
+/// reaches here and is therefore arbitrary bytes, NUL included.
+///
+/// Borrowed: valid only for the duration of the callback.
+pub const ClipboardContent = extern struct {
+    mime_ptr: [*]const u8,
+    mime_len: usize,
+    data_ptr: [*]const u8,
+    data_len: usize,
+};
+
+/// C callbacks for the effects a producer's stream can raise.
+///
+/// A producer's stream defaults to the READONLY effect set, which drops every
+/// sequence needing a response or an outside side effect. That is the right
+/// default for a pure state mirror and the wrong one for a terminal a program
+/// talks to: with no `write_pty` the stream cannot answer a query at all, and
+/// the Kitty graphics protocol gates its response on exactly that
+/// (`stream_terminal.zig` checks `effects.write_pty == null` before encoding
+/// one), so an embedder without this could never advertise image support.
+///
+/// Trampolines are installed unconditionally at producer creation and a null
+/// member is a no-op, so callbacks may be set, changed or cleared at any time
+/// and take effect on the next fed byte.
+///
+/// THREADING: every callback fires from inside `feed`, holding the producer's
+/// terminal mutex. An implementation MUST NOT call back into the same producer
+/// (`feed`, `resize`, `set_callbacks`, `free`) or it will deadlock, and MUST
+/// NOT retain any pointer it is handed.
+pub const Callbacks = extern struct {
+    userdata: ?*anyopaque = null,
+
+    /// Bytes the terminal is answering the program with — a DECRQM reply, a
+    /// Kitty graphics response, an XTVERSION report. The embedder is expected
+    /// to write them to whatever carries its input back to the program.
+    write_pty: ?WritePtyFn = null,
+
+    /// An OSC 52 clipboard WRITE. Read requests never reach here: the stream
+    /// handler refuses them before the effect, so a program cannot use this to
+    /// exfiltrate the clipboard.
+    clipboard_write: ?ClipboardWriteFn = null,
+
+    pub const WritePtyFn = *const fn (
+        ?*Producer,
+        ?*anyopaque,
+        [*]const u8,
+        usize,
+    ) callconv(.c) void;
+
+    pub const ClipboardWriteFn = *const fn (
+        ?*Producer,
+        ?*anyopaque,
+        clipboard.Location,
+        ?[*]const ClipboardContent,
+        usize,
+    ) callconv(.c) clipboard.WriteResult;
+};
+
 pub const Producer = struct {
     alloc: std.mem.Allocator,
     terminal: *SharedTerminal,
     stream: TerminalStream,
+    /// C callbacks, reached from the trampolines below. They recover this
+    /// struct with `@fieldParentPtr("stream", …)`, which is sound only because
+    /// a Producer is heap-allocated once and never copied or moved afterwards.
+    callbacks: Callbacks = .{},
 
     /// Set once the terminal may no longer reflect the fed sequence: the
     /// stream reported a semantic failure or a resize failed partway. A
@@ -46,10 +110,18 @@ pub const Producer = struct {
         });
         errdefer terminal.release();
 
+        var stream = terminal.terminal.vtStream();
+        // Installed unconditionally, so a callback set later takes effect on
+        // the next fed byte without rebuilding the stream. Each trampoline
+        // no-ops when its C member is null, which is the readonly behaviour
+        // this replaces.
+        stream.handler.effects.write_pty = &writePtyTrampoline;
+        stream.handler.effects.clipboard_write = &clipboardWriteTrampoline;
+
         self.* = .{
             .alloc = alloc,
             .terminal = terminal,
-            .stream = terminal.terminal.vtStream(),
+            .stream = stream,
         };
         return self;
     }
@@ -59,6 +131,56 @@ pub const Producer = struct {
         self.stream.deinit();
         self.terminal.release();
         alloc.destroy(self);
+    }
+
+    /// Recover the owning producer from a stream handler. Sound because a
+    /// Producer is created by `alloc.create` and never copied afterwards.
+    fn fromHandler(handler: *TerminalStream.Handler) *Producer {
+        const stream_ptr: *TerminalStream = @fieldParentPtr("handler", handler);
+        return @fieldParentPtr("stream", stream_ptr);
+    }
+
+    fn writePtyTrampoline(handler: *TerminalStream.Handler, data: [:0]const u8) void {
+        const self = fromHandler(handler);
+        const func = self.callbacks.write_pty orelse return;
+        func(self, self.callbacks.userdata, data.ptr, data.len);
+    }
+
+    fn clipboardWriteTrampoline(
+        handler: *TerminalStream.Handler,
+        write: clipboard.Write,
+    ) clipboard.WriteResult {
+        const self = fromHandler(handler);
+        const func = self.callbacks.clipboard_write orelse return .unsupported;
+
+        // OSC 52 produces one representation today, so keep that path
+        // allocation-free while still passing a multi-MIME write through
+        // whole rather than silently dropping representations.
+        var stack: [4]ClipboardContent = undefined;
+        const spilled = write.contents.len > stack.len;
+        const contents: []ClipboardContent = if (!spilled)
+            stack[0..write.contents.len]
+        else
+            self.terminal.terminal.gpa().alloc(ClipboardContent, write.contents.len) catch
+                return .io_error;
+        defer if (spilled) self.terminal.terminal.gpa().free(contents);
+
+        for (contents, write.contents) |*out, in| {
+            out.* = .{
+                .mime_ptr = in.mime.ptr,
+                .mime_len = in.mime.len,
+                .data_ptr = in.data.ptr,
+                .data_len = in.data.len,
+            };
+        }
+
+        return func(
+            self,
+            self.callbacks.userdata,
+            write.location,
+            if (contents.len > 0) contents.ptr else null,
+            contents.len,
+        );
     }
 
     fn feed(self: *Producer, bytes: []const u8) Result {
@@ -209,6 +331,23 @@ pub export fn ghostty_terminal_producer_resize_and_feed(
     return value.resizeAndFeed(columns, rows, cell_width_px, cell_height_px, bytes);
 }
 
+/// Install (or clear) the producer's C callbacks.
+///
+/// A null `callbacks` clears every member, returning the producer to the
+/// readonly behaviour it has before this is called. Passing a struct with a
+/// null member clears that member alone. Safe to call at any time; the change
+/// applies to the next fed byte.
+pub export fn ghostty_terminal_producer_set_callbacks(
+    producer: ?*Producer,
+    callbacks: ?*const Callbacks,
+) Result {
+    const value = producer orelse return .invalid_input;
+    value.terminal.mutex.lockUncancelable(value.terminal.terminal.io());
+    defer value.terminal.mutex.unlock(value.terminal.terminal.io());
+    value.callbacks = if (callbacks) |c| c.* else .{};
+    return .ok;
+}
+
 pub export fn ghostty_terminal_producer_free(producer: ?*Producer) void {
     if (producer) |value| value.deinit();
 }
@@ -239,6 +378,7 @@ test "terminal producer C ABI matches ghostty header" {
     try testing.expect(@hasDecl(c, "ghostty_terminal_producer_resize"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_producer_resize_and_feed"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_producer_free"));
+    try testing.expect(@hasDecl(c, "ghostty_terminal_producer_set_callbacks"));
     try testing.expect(@hasDecl(c, "ghostty_terminal_release"));
     try testing.expectEqual(
         @sizeOf(c_int),
@@ -261,6 +401,37 @@ test "terminal producer C ABI matches ghostty header" {
         @as(c_int, c.GHOSTTY_TERMINAL_PRODUCER_RESULT_SEMANTIC_FAILURE),
     );
     try expectStructLayout(Config, c.ghostty_terminal_producer_config_s);
+    try expectStructLayout(
+        ClipboardContent,
+        c.ghostty_terminal_producer_clipboard_content_s,
+    );
+    try expectStructLayout(
+        Callbacks,
+        c.ghostty_terminal_producer_callbacks_s,
+    );
+
+    // The clipboard enums are shared with the VT handler's own types, so a
+    // divergence here would silently mislabel a destination or a verdict.
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(clipboard.Location.standard)),
+        @as(c_int, c.GHOSTTY_TERMINAL_PRODUCER_CLIPBOARD_STANDARD),
+    );
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(clipboard.Location.selection)),
+        @as(c_int, c.GHOSTTY_TERMINAL_PRODUCER_CLIPBOARD_SELECTION),
+    );
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(clipboard.Location.primary)),
+        @as(c_int, c.GHOSTTY_TERMINAL_PRODUCER_CLIPBOARD_PRIMARY),
+    );
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(clipboard.WriteResult.success)),
+        @as(c_int, c.GHOSTTY_TERMINAL_PRODUCER_CLIPBOARD_SUCCESS),
+    );
+    try testing.expectEqual(
+        @as(c_int, @intFromEnum(clipboard.WriteResult.io_error)),
+        @as(c_int, c.GHOSTTY_TERMINAL_PRODUCER_CLIPBOARD_IO_ERROR),
+    );
 }
 
 test "terminal producer C defaults and validation" {
@@ -758,4 +929,203 @@ test "terminal producer resize and feed is never observed between its steps" {
 
     try testing.expect(observer.observed.load(.monotonic) > 0);
     try testing.expectEqual(@as(usize, 0), observer.mismatches.load(.monotonic));
+}
+
+
+/// Captures what the C callbacks were handed, so the tests below assert on the
+/// values that actually crossed the boundary rather than on internal state.
+const CaptureCallbacks = struct {
+    var written: ?[]u8 = null;
+    var userdata: ?*anyopaque = null;
+    var producer_seen: ?*Producer = null;
+    var clipboard_mime: ?[]u8 = null;
+    var clipboard_data: ?[]u8 = null;
+    var clipboard_location: clipboard.Location = .standard;
+    var clipboard_count: usize = 0;
+    var clipboard_verdict: clipboard.WriteResult = .success;
+
+    fn reset() void {
+        const alloc = std.testing.allocator;
+        if (written) |w| alloc.free(w);
+        if (clipboard_mime) |m| alloc.free(m);
+        if (clipboard_data) |d| alloc.free(d);
+        written = null;
+        clipboard_mime = null;
+        clipboard_data = null;
+        userdata = null;
+        producer_seen = null;
+        clipboard_count = 0;
+        clipboard_verdict = .success;
+    }
+
+    fn writePty(
+        producer: ?*Producer,
+        ud: ?*anyopaque,
+        ptr: [*]const u8,
+        len: usize,
+    ) callconv(.c) void {
+        const alloc = std.testing.allocator;
+        if (written) |w| alloc.free(w);
+        written = alloc.dupe(u8, ptr[0..len]) catch @panic("OOM");
+        userdata = ud;
+        producer_seen = producer;
+    }
+
+    fn clipboardWrite(
+        producer: ?*Producer,
+        ud: ?*anyopaque,
+        location: clipboard.Location,
+        contents: ?[*]const ClipboardContent,
+        contents_len: usize,
+    ) callconv(.c) clipboard.WriteResult {
+        const alloc = std.testing.allocator;
+        userdata = ud;
+        producer_seen = producer;
+        clipboard_location = location;
+        clipboard_count = contents_len;
+        if (contents) |ptr| if (contents_len > 0) {
+            const first = ptr[0];
+            if (clipboard_mime) |m| alloc.free(m);
+            if (clipboard_data) |d| alloc.free(d);
+            clipboard_mime = alloc.dupe(u8, first.mime_ptr[0..first.mime_len]) catch
+                @panic("OOM");
+            clipboard_data = alloc.dupe(u8, first.data_ptr[0..first.data_len]) catch
+                @panic("OOM");
+        };
+        return clipboard_verdict;
+    }
+};
+
+test "terminal producer answers a query only once write_pty is installed" {
+    const testing = std.testing;
+    CaptureCallbacks.reset();
+    defer CaptureCallbacks.reset();
+
+    const config: Config = .{ .columns = 20, .rows = 4 };
+    var out: ?*Producer = null;
+    try testing.expectEqual(Result.ok, ghostty_terminal_producer_new(&config, &out));
+    const producer = out.?;
+    defer ghostty_terminal_producer_free(producer);
+
+    // Before any callback the producer is mute: this is the readonly default
+    // every embedder used to be stuck with.
+    _ = ghostty_terminal_producer_feed(producer, "\x1b[?7$p", 6);
+    try testing.expect(CaptureCallbacks.written == null);
+
+    var sentinel: u8 = 42;
+    var callbacks: Callbacks = .{
+        .userdata = @ptrCast(&sentinel),
+        .write_pty = &CaptureCallbacks.writePty,
+    };
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_terminal_producer_set_callbacks(producer, &callbacks),
+    );
+
+    // DECRQM for wraparound (mode 7, set by default) now round-trips.
+    _ = ghostty_terminal_producer_feed(producer, "\x1b[?7$p", 6);
+    try testing.expectEqualStrings("\x1B[?7;1$y", CaptureCallbacks.written.?);
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(&sentinel)), CaptureCallbacks.userdata);
+    try testing.expectEqual(producer, CaptureCallbacks.producer_seen);
+}
+
+test "terminal producer answers a kitty graphics support query" {
+    const testing = std.testing;
+    CaptureCallbacks.reset();
+    defer CaptureCallbacks.reset();
+
+    const config: Config = .{ .columns = 20, .rows = 4 };
+    var out: ?*Producer = null;
+    try testing.expectEqual(Result.ok, ghostty_terminal_producer_new(&config, &out));
+    const producer = out.?;
+    defer ghostty_terminal_producer_free(producer);
+
+    var callbacks: Callbacks = .{ .write_pty = &CaptureCallbacks.writePty };
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_terminal_producer_set_callbacks(producer, &callbacks),
+    );
+
+    // The support probe every image-capable tool sends before transmitting:
+    // a 1x1 RGB direct transmission with a=q. An unanswered probe is read as
+    // "this terminal has no image support", which is why a mute producer
+    // never sees an image at all.
+    const probe = "\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
+    _ = ghostty_terminal_producer_feed(producer, probe, probe.len);
+
+    const reply = CaptureCallbacks.written orelse
+        return testing.expect(false) catch error.NoKittyResponse;
+    try testing.expect(std.mem.startsWith(u8, reply, "\x1b_G"));
+    try testing.expect(std.mem.indexOf(u8, reply, "i=31") != null);
+    try testing.expect(std.mem.indexOf(u8, reply, "OK") != null);
+}
+
+test "terminal producer forwards an OSC 52 write and refuses a read" {
+    const testing = std.testing;
+    CaptureCallbacks.reset();
+    defer CaptureCallbacks.reset();
+
+    const config: Config = .{ .columns = 20, .rows = 4 };
+    var out: ?*Producer = null;
+    try testing.expectEqual(Result.ok, ghostty_terminal_producer_new(&config, &out));
+    const producer = out.?;
+    defer ghostty_terminal_producer_free(producer);
+
+    var callbacks: Callbacks = .{
+        .write_pty = &CaptureCallbacks.writePty,
+        .clipboard_write = &CaptureCallbacks.clipboardWrite,
+    };
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_terminal_producer_set_callbacks(producer, &callbacks),
+    );
+
+    // OSC 52 write: "aGk=" is base64 for "hi".
+    const write_seq = "\x1b]52;c;aGk=\x1b\\";
+    _ = ghostty_terminal_producer_feed(producer, write_seq, write_seq.len);
+    try testing.expectEqual(@as(usize, 1), CaptureCallbacks.clipboard_count);
+    try testing.expectEqual(clipboard.Location.standard, CaptureCallbacks.clipboard_location);
+    try testing.expectEqualStrings("hi", CaptureCallbacks.clipboard_data.?);
+
+    // A READ request must never reach the callback: the handler drops it
+    // before the effect, so a program cannot exfiltrate the clipboard.
+    CaptureCallbacks.clipboard_count = 0;
+    const read_seq = "\x1b]52;c;?\x1b\\";
+    _ = ghostty_terminal_producer_feed(producer, read_seq, read_seq.len);
+    try testing.expectEqual(@as(usize, 0), CaptureCallbacks.clipboard_count);
+}
+
+test "terminal producer callbacks clear back to readonly" {
+    const testing = std.testing;
+    CaptureCallbacks.reset();
+    defer CaptureCallbacks.reset();
+
+    const config: Config = .{ .columns = 20, .rows = 4 };
+    var out: ?*Producer = null;
+    try testing.expectEqual(Result.ok, ghostty_terminal_producer_new(&config, &out));
+    const producer = out.?;
+    defer ghostty_terminal_producer_free(producer);
+
+    var callbacks: Callbacks = .{ .write_pty = &CaptureCallbacks.writePty };
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_terminal_producer_set_callbacks(producer, &callbacks),
+    );
+    _ = ghostty_terminal_producer_feed(producer, "\x1b[?7$p", 6);
+    try testing.expect(CaptureCallbacks.written != null);
+
+    // A null pointer restores the readonly default rather than leaving a
+    // stale function pointer installed.
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_terminal_producer_set_callbacks(producer, null),
+    );
+    CaptureCallbacks.reset();
+    _ = ghostty_terminal_producer_feed(producer, "\x1b[?7$p", 6);
+    try testing.expect(CaptureCallbacks.written == null);
+
+    try testing.expectEqual(
+        Result.invalid_input,
+        ghostty_terminal_producer_set_callbacks(null, &callbacks),
+    );
 }
