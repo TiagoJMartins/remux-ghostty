@@ -7,6 +7,7 @@ const std = @import("std");
 const global = @import("../global.zig");
 const SharedTerminal = @import("Shared.zig");
 const clipboard = @import("../terminal/clipboard.zig");
+const device_attributes = @import("../terminal/device_attributes.zig");
 const TerminalStream = @import("../terminal/stream_terminal.zig").Stream;
 
 pub const Result = enum(c_int) {
@@ -117,6 +118,7 @@ pub const Producer = struct {
         // this replaces.
         stream.handler.effects.write_pty = &writePtyTrampoline;
         stream.handler.effects.clipboard_write = &clipboardWriteTrampoline;
+        stream.handler.effects.device_attributes = &deviceAttributesEffect;
 
         self.* = .{
             .alloc = alloc,
@@ -138,6 +140,24 @@ pub const Producer = struct {
     fn fromHandler(handler: *TerminalStream.Handler) *Producer {
         const stream_ptr: *TerminalStream = @fieldParentPtr("handler", handler);
         return @fieldParentPtr("stream", stream_ptr);
+    }
+
+    /// DA1/DA2 replies, the same values desktop Ghostty sends
+    /// (termio/stream_handler.zig): a VT220 with colour, and clipboard access
+    /// when the embedder installed `clipboard_write`. The reply still travels
+    /// through `write_pty`, so a producer without it stays mute.
+    fn deviceAttributesEffect(handler: *TerminalStream.Handler) device_attributes.Attributes {
+        const self = fromHandler(handler);
+        return .{
+            .primary = .{
+                .conformance_level = .level_2,
+                .features = if (self.callbacks.clipboard_write != null)
+                    &.{ .ansi_color, .clipboard }
+                else
+                    &.{.ansi_color},
+            },
+            .secondary = .{ .device_type = .vt220, .firmware_version = 10 },
+        };
     }
 
     fn writePtyTrampoline(handler: *TerminalStream.Handler, data: []const u8) void {
@@ -1041,6 +1061,32 @@ test "terminal producer answers a query only once write_pty is installed" {
     try testing.expectEqualStrings("\x1B[?7;1$y", CaptureCallbacks.written.?);
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(&sentinel)), CaptureCallbacks.userdata);
     try testing.expectEqual(producer, CaptureCallbacks.producer_seen);
+}
+
+test "terminal producer answers DA1, DA2 and XTVERSION through write_pty" {
+    const testing = std.testing;
+
+    CaptureCallbacks.reset();
+    defer CaptureCallbacks.reset();
+
+    const config: Config = .{ .columns = 20, .rows = 4 };
+    var out: ?*Producer = null;
+    try testing.expectEqual(Result.ok, ghostty_terminal_producer_new(&config, &out));
+    const producer = out.?;
+    defer ghostty_terminal_producer_free(producer);
+
+    var callbacks: Callbacks = .{ .write_pty = &CaptureCallbacks.writePty };
+    try testing.expectEqual(
+        Result.ok,
+        ghostty_terminal_producer_set_callbacks(producer, &callbacks),
+    );
+
+    _ = ghostty_terminal_producer_feed(producer, "\x1b[c", 3);
+    try testing.expectEqualStrings("\x1B[?62;22c", CaptureCallbacks.written.?);
+    _ = ghostty_terminal_producer_feed(producer, "\x1b[>c", 4);
+    try testing.expectEqualStrings("\x1B[>1;10;0c", CaptureCallbacks.written.?);
+    _ = ghostty_terminal_producer_feed(producer, "\x1b[>q", 4);
+    try testing.expect(std.mem.startsWith(u8, CaptureCallbacks.written.?, "\x1BP>|"));
 }
 
 test "terminal producer answers a kitty graphics support query" {
