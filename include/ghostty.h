@@ -2116,6 +2116,13 @@ ghostty_terminal_surface_mouse_button(
     ghostty_input_mouse_button_e,
     ghostty_input_mods_e);
 
+// Jump by OSC 133 semantic prompts: negative is previous, positive is next.
+// Counts beyond available prompts clamp to the furthest prompt; a prompt in
+// the active screen returns to the live viewport. This never sends PTY input.
+// Returns true only if the viewport moved. NULL, zero, and no target return false.
+GHOSTTY_API bool ghostty_terminal_surface_jump_to_prompt(
+    ghostty_terminal_surface_t, int delta);
+
 // Negative deltas are down/left and positive deltas are up/right. Precise input
 // is accumulated until it reaches a cell; non-precision input follows Ghostty's
 // platform wheel-tick behavior. Alternate-screen cursor input and remote wheel
