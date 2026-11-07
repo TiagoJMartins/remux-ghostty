@@ -557,6 +557,20 @@ pub fn clearSelection(
     if (changed) try self.terminalChanged();
 }
 
+/// Navigate semantic prompts locally, independently of input routing.
+pub fn jumpToPrompt(self: *TerminalSurface, delta: c_int) bool {
+    if (delta == 0) return false;
+    self.shared.mutex.lockUncancelable(global.io());
+    const screen = self.shared.terminal.screens.active;
+    const before = screen.pages.scrollbar().offset;
+    screen.scroll(.{ .delta_prompt = delta });
+    const changed = before != screen.pages.scrollbar().offset;
+    if (changed) self.runtime.state.scroll_cell_offset = 0;
+    self.shared.mutex.unlock(global.io());
+    if (changed) self.committedStateChanged();
+    return changed;
+}
+
 /// Scroll to an absolute row plus fractional cell offset. The canonical
 /// terminal viewport and renderer presentation offset are published together.
 /// The output is filled before any notification failure is returned. Repeating
@@ -3170,4 +3184,37 @@ test "terminal surface pointer and pressure validation" {
     try testing.expect(validPointerCoordinate(2_147_483_520, 0));
     try testing.expect(!validPointerCoordinate(2_147_483_648, 0));
     try testing.expect(!validPointerCoordinate(-2_147_483_520, 256));
+}
+
+test "prompt jumps navigate OSC 133 history locally and report movement" {
+    const testing = std.testing;
+    const shared = try terminal.Shared.init(testing.allocator, .{
+        .cols = 20,
+        .rows = 3,
+    });
+    defer shared.release();
+    var sink: TestSink = .{ .shared = shared };
+    var surface = testSurface(testing.allocator, shared, sink.writeSink());
+
+    try testing.expect(!surface.jumpToPrompt(-1));
+    testFeed(shared, "\x1b]133;A\x07$ one\x1b]133;B\x07\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+    testFeed(shared, "\x1b]133;A\x07$ two\x1b]133;B\x07\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+    testFeed(shared, "\x1b]133;A\x07$ three\x1b]133;B\x07\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+    testFeed(shared, "\x1b]133;A\x07$ ");
+    const pages = &shared.terminal.screens.active.pages;
+    try testing.expectEqual(@as(usize, 4), pages.scrollbar().offset);
+    try testing.expect(!surface.jumpToPrompt(0));
+    try testing.expect(surface.jumpToPrompt(-1));
+    try testing.expectEqual(@as(usize, 2), pages.scrollbar().offset);
+    surface.runtime.state.scroll_cell_offset = 0.5;
+    try testing.expect(surface.jumpToPrompt(std.math.minInt(c_int)));
+    try testing.expectEqual(@as(f64, 0), surface.runtime.state.scroll_cell_offset);
+    try testing.expectEqual(@as(usize, 0), pages.scrollbar().offset);
+    try testing.expect(!surface.jumpToPrompt(-1));
+    try testing.expect(surface.jumpToPrompt(1));
+    try testing.expectEqual(@as(usize, 2), pages.scrollbar().offset);
+    try testing.expect(surface.jumpToPrompt(std.math.maxInt(c_int)));
+    try testing.expectEqual(@as(usize, 4), pages.scrollbar().offset);
+    try testing.expect(!surface.jumpToPrompt(1));
+    try testing.expectEqual(@as(usize, 0), sink.calls);
 }

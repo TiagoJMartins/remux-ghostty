@@ -771,6 +771,14 @@ pub const CAPI = if (apprt.runtime == apprt.embedded) struct {
         return value.core.mouseButton(state, button, mods);
     }
 
+    export fn ghostty_terminal_surface_jump_to_prompt(
+        surface: ?*Surface,
+        delta: c_int,
+    ) bool {
+        const value = surface orelse return false;
+        return value.core.jumpToPrompt(delta);
+    }
+
     export fn ghostty_terminal_surface_mouse_scroll(
         surface: ?*Surface,
         x: f64,
