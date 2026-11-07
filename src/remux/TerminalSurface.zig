@@ -3188,7 +3188,7 @@ test "terminal surface pointer and pressure validation" {
 
 test "prompt jumps navigate OSC 133 history locally and report movement" {
     const testing = std.testing;
-    const shared = try terminal.Shared.init(testing.allocator, .{
+    const shared = try Shared.init(testing.io, testing.allocator, .{
         .cols = 20,
         .rows = 3,
     });
